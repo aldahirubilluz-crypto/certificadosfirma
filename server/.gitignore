@@ -1,0 +1,26 @@
+# Binaries
+/bin/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Dependencies
+/vendor/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+
+# Editor/IDE
+.vscode/
+*.swp
+*.swo
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
