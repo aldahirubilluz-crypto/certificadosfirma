@@ -1,5 +1,6 @@
 // ============================================
 // internal/repository/windows_certificate_repository.go
+// OPTIMIZADO
 // ============================================
 package repository
 
@@ -8,7 +9,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
-	"regexp"
 	"server/internal/dto"
 	"strings"
 	"time"
@@ -45,9 +45,11 @@ func (r *WindowsCertificateRepository) FindAll() ([]dto.Certificate, error) {
 		windows.CertCloseStore(store, 0)
 	}()
 
-	var certificates []dto.Certificate
+	certificates := make([]dto.Certificate, 0, 32)
+	seen := make(map[string]bool, 128)
 	var ctx *windows.CertContext
-	seen := make(map[string]bool)
+
+	now := time.Now()
 
 	log.Println("🔍 Enumerando certificados...")
 
@@ -58,26 +60,28 @@ func (r *WindowsCertificateRepository) FindAll() ([]dto.Certificate, error) {
 				log.Printf("✅ Enumeración completada. Total: %d certificados únicos\n", len(certificates))
 				break
 			}
-			log.Printf("⚠️ Error enumerando certificados: %v - Finalizando\n", err)
 			break
 		}
 
 		if ctx == nil {
-			log.Println("✅ Contexto nulo, finalizando enumeración")
 			break
 		}
 
-		cert := r.parseCertContext(ctx)
-		if cert != nil {
-			if !seen[cert.Thumbprint] {
-				seen[cert.Thumbprint] = true
-				log.Printf("📜 #%d: %s (%s)\n", len(certificates)+1, cert.CommonName, cert.Tipo())
-				certificates = append(certificates, *cert)
-			}
+		cert := r.parseCertContext(ctx, now)
+		if cert == nil {
+			continue
 		}
 
-		if len(certificates) >= 100 {
-			log.Println("⚠️ Límite de 100 certificados únicos alcanzado")
+		// Evitar duplicados por thumbprint
+		if seen[cert.Thumbprint] {
+			continue
+		}
+		seen[cert.Thumbprint] = true
+
+		certificates = append(certificates, *cert)
+
+		if len(certificates) >= 200 {
+			log.Println("⚠️ Se alcanzó el límite de 200 certificados únicos (protección overflow)")
 			break
 		}
 	}
@@ -86,71 +90,76 @@ func (r *WindowsCertificateRepository) FindAll() ([]dto.Certificate, error) {
 	return certificates, nil
 }
 
-func (r *WindowsCertificateRepository) parseCertContext(ctx *windows.CertContext) *dto.Certificate {
-	if ctx == nil || ctx.EncodedCert == nil || ctx.Length == 0 {
+// ====================================================================================
+// parseCertContext optimizado
+// ====================================================================================
+func (r *WindowsCertificateRepository) parseCertContext(ctx *windows.CertContext, now time.Time) *dto.Certificate {
+	if ctx == nil || ctx.EncodedCert == nil || ctx.Length < 128 {
 		return nil
 	}
 
-	certBytes := make([]byte, ctx.Length)
-	for i := uint32(0); i < ctx.Length; i++ {
-		certBytes[i] = *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(ctx.EncodedCert)) + uintptr(i)))
-	}
+	// Leer el certificado de memoria nativa usando unsafe.Slice (mucho más rápido)
+	certBytes := unsafe.Slice((*byte)(unsafe.Pointer(ctx.EncodedCert)), ctx.Length)
 
-	cert, err := x509.ParseCertificate(certBytes)
+	parsed, err := x509.ParseCertificate(certBytes)
 	if err != nil {
 		return nil
 	}
 
-	thumbprint := fmt.Sprintf("%X", sha1.Sum(cert.Raw))
-	commonName := extractCommonName(cert.Subject.String())
-	ownerName := extractOwnerName(cert.Subject.String())
-	orgName := extractOrganization(cert.Subject.String())
-	issuerName := extractCommonName(cert.Issuer.String())
-	dni := extractDNI(cert.Subject.String())
-	hasPrivateKey := r.hasPrivateKey(ctx)
-	isDNIe := detectDNIe(cert)
+	subject := parsed.Subject.String()
+	issuer := parsed.Issuer.String()
 
-	now := time.Now()
-	isValid := now.After(cert.NotBefore) && now.Before(cert.NotAfter)
-	daysUntilExpiry := int(cert.NotAfter.Sub(now).Hours() / 24)
+	// Cache string lowercase para evitar ToLower en cada llamada
+	subLower := strings.ToLower(subject)
+	issLower := strings.ToLower(issuer)
 
-	return &dto.Certificate{
-		Subject:          cert.Subject.String(),
-		Issuer:           cert.Issuer.String(),
-		CommonName:       commonName,
-		OwnerName:        ownerName,
-		OrganizationName: orgName,
-		IssuerName:       issuerName,
-		DNI:              dni,
-		SerialNumber:     cert.SerialNumber.String(),
-		NotBefore:        cert.NotBefore,
-		NotAfter:         cert.NotAfter,
-		HasPrivateKey:    hasPrivateKey,
-		IsDNIe:           isDNIe,
-		Thumbprint:       thumbprint,
-		IsValid:          isValid,
-		DaysUntilExpiry:  daysUntilExpiry,
+	cert := &dto.Certificate{
+		Subject:          subject,
+		Issuer:           issuer,
+		CommonName:       extractCommonName(subject),
+		OwnerName:        extractOwnerName(subject),
+		OrganizationName: extractOrganization(subject),
+		IssuerName:       extractCommonName(issuer),
+		DNI:              extractDNI(subject),
+		SerialNumber:     parsed.SerialNumber.String(),
+		NotBefore:        parsed.NotBefore,
+		NotAfter:         parsed.NotAfter,
+		HasPrivateKey:    r.hasPrivateKey(ctx),
+		IsDNIe:           detectDNIe(subLower, issLower),
+		Thumbprint:       fmt.Sprintf("%X", sha1.Sum(parsed.Raw)),
 	}
+
+	cert.IsValid = now.After(parsed.NotBefore) && now.Before(parsed.NotAfter)
+	cert.DaysUntilExpiry = int(parsed.NotAfter.Sub(now).Hours() / 24)
+
+	return cert
 }
 
+// ==============================================================================
+// PRIVATE KEY CHECK
+// ==============================================================================
 func (r *WindowsCertificateRepository) hasPrivateKey(ctx *windows.CertContext) bool {
 	if ctx == nil {
 		return false
 	}
 
-	var cbData uint32
+	var size uint32
+
 	ret, _, _ := procCertGetCertificateContextProperty.Call(
 		uintptr(unsafe.Pointer(ctx)),
 		certKeyProvInfoPropID,
 		0,
-		uintptr(unsafe.Pointer(&cbData)),
+		uintptr(unsafe.Pointer(&size)),
 	)
-	return ret != 0 && cbData > 0
+
+	return ret != 0 && size > 0
 }
 
+// ==============================================================================
+// EXTRACTION HELPERS (OPTIMIZADOS SIN REGEX)
+// ==============================================================================
 func extractCommonName(subject string) string {
-	parts := strings.Split(subject, ",")
-	for _, part := range parts {
+	for _, part := range strings.Split(subject, ",") {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(strings.ToUpper(part), "CN=") {
 			return strings.TrimPrefix(part, "CN=")
@@ -160,63 +169,51 @@ func extractCommonName(subject string) string {
 }
 
 func extractOwnerName(subject string) string {
-	// Buscar el nombre completo en el CN
 	cn := extractCommonName(subject)
-	
-	// Si es DNIe, extraer el nombre antes de "FAU" o el CN completo
-	if strings.Contains(cn, "FAU") {
-		parts := strings.Split(cn, "FAU")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
-		}
+
+	if idx := strings.Index(cn, "FAU"); idx > 0 {
+		return strings.TrimSpace(cn[:idx])
 	}
-	
-	// Si tiene apellidos y nombres separados
-	re := regexp.MustCompile(`CN=([^,]+)`)
-	if matches := re.FindStringSubmatch(subject); len(matches) > 1 {
-		name := strings.TrimSpace(matches[1])
-		// Limpiar sufijos comunes
-		name = strings.TrimSuffix(name, " soft")
-		return name
-	}
-	
-	return cn
+
+	return strings.TrimSuffix(cn, " soft")
 }
 
 func extractOrganization(subject string) string {
-	parts := strings.Split(subject, ",")
-	for _, part := range parts {
+	for _, part := range strings.Split(subject, ",") {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(strings.ToUpper(part), "O=") {
-			org := strings.TrimPrefix(part, "O=")
-			return org
+			return strings.TrimPrefix(part, "O=")
 		}
 	}
 	return "CertSoft"
 }
 
 func extractDNI(subject string) string {
-	re := regexp.MustCompile(`PNOPE-(\d{8})`)
-	if matches := re.FindStringSubmatch(subject); len(matches) > 1 {
-		return matches[1]
+	// Mucho más rápido que regex
+	// Busca: PNOPE-########
+	idx := strings.Index(subject, "PNOPE-")
+	if idx == -1 {
+		return ""
+	}
+
+	if idx+6+8 <= len(subject) {
+		return subject[idx+6 : idx+14]
 	}
 	return ""
 }
 
-func detectDNIe(cert *x509.Certificate) bool {
-	subject := strings.ToLower(cert.Subject.String())
-	issuer := strings.ToLower(cert.Issuer.String())
-
-	// Un DNIe físico NUNCA tiene "soft" en el CN
-	if strings.Contains(subject, "soft") {
+// ==============================================================================
+// DNIe DETECTION (OPTIMIZADO)
+// ==============================================================================
+func detectDNIe(subjectLower, issuerLower string) bool {
+	// DNIe físico NO contiene "soft"
+	if strings.Contains(subjectLower, "soft") {
 		return false
 	}
 
-	// Un DNIe físico tiene PNOPE pero NO tiene "fau" (firma de autoridad)
-	hasPNOPE := strings.Contains(subject, "pnope-")
-	hasFAU := strings.Contains(strings.ToLower(cert.Subject.String()), "fau")
-	hasRENIEC := strings.Contains(issuer, "reniec")
+	hasPNOPE := strings.Contains(subjectLower, "pnope-")
+	hasRENIEC := strings.Contains(issuerLower, "reniec")
+	hasFAU := strings.Contains(subjectLower, "fau")
 
-	// DNIe físico: tiene PNOPE, emitido por RENIEC, pero NO tiene FAU ni "soft"
 	return hasPNOPE && hasRENIEC && !hasFAU
 }

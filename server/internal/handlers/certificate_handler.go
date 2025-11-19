@@ -21,20 +21,3 @@ func GetAllCertificates(c fiber.Ctx) error {
 
 	return c.JSON(response)
 }
-
-func GetCertificateByThumbprint(c fiber.Ctx) error {
-	thumbprint := c.Params("thumbprint")
-
-	cert, err := certService.GetCertificateByThumbprint(thumbprint)
-	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error":   "Certificado no encontrado",
-			"success": false,
-		})
-	}
-
-	return c.JSON(fiber.Map{
-		"data":    cert,
-		"success": true,
-	})
-}

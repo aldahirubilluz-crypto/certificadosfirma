@@ -12,5 +12,4 @@ func RegisterCertificateRoutes(router fiber.Router) {
 	certs := router.Group("certificates")
 	
 	certs.Get("/", handlers.GetAllCertificates)
-	certs.Get("/:thumbprint", handlers.GetCertificateByThumbprint)
 }

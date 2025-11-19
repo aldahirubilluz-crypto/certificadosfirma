@@ -8,10 +8,5 @@ import (
 )
 
 func RegisterRoutes(app *fiber.App) {
-	app.Get("/health", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
-	})
-
-	api := app.Group("/api/v1")
-	RegisterCertificateRoutes(api)
+	RegisterCertificateRoutes(app)
 }
